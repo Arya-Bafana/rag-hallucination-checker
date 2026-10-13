@@ -4,7 +4,7 @@ import numpy as np, joblib, streamlit as st, spacy
 from spacy.lang.en.stop_words import STOP_WORDS
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-MODEL_ID = 'KRLabsOrg/lettucedetect-base-modernbert-en-v1'   # use the spelling that worked in notebook Cell 11
+MODEL_ID = 'KRLabsOrg/lettucedect-base-modernbert-en-v1'   # use the spelling that worked in notebook Cell 11
 DEEP_DEFAULT = True      # set to False if the free host reports "over its resource limits" (then only the cheap stage runs by default)
 
 st.set_page_config(page_title='RAG hallucination checker', layout='wide')
