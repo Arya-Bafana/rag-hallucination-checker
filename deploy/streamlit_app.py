@@ -1,99 +1,305 @@
-# RAG hallucination checker: cheap Stage 1 gate + LettuceDetect (CPU only). Student research prototype.
-import html, json, os, re, time
-import numpy as np, joblib, streamlit as st, spacy
+
+# RAG hallucination checker: from-scratch Stage 1 gate + LettuceDetect.
+# CPU-only student research prototype.
+
+import html
+import json
+import os
+import re
+import time
+
+import numpy as np
+import streamlit as st
+import spacy
 from spacy.lang.en.stop_words import STOP_WORDS
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-MODEL_ID = 'KRLabsOrg/lettucedect-base-modernbert-en-v1'   # use the spelling that worked in notebook Cell 11
-DEEP_DEFAULT = True      # set to False if the free host reports "over its resource limits" (then only the cheap stage runs by default)
+MODEL_ID = "KRLabsOrg/lettucedect-base-modernbert-en-v1"
+WEIGHTS_FILE = os.path.join(HERE, "stage1_weights.json")
+DEEP_DEFAULT = True
 
-st.set_page_config(page_title='RAG hallucination checker', layout='wide')
+st.set_page_config(page_title="RAG hallucination checker", layout="wide")
+
 
 @st.cache_resource
 def load_stage1():
+    """Load spaCy and the from-scratch Logistic Regression weights."""
     try:
-        nlp = spacy.load('en_core_web_sm')
+        nlp = spacy.load("en_core_web_sm")
     except OSError:
         from spacy.cli import download
-        download('en_core_web_sm')
-        nlp = spacy.load('en_core_web_sm')
-    clf = joblib.load(os.path.join(HERE, 'stage1_clf.joblib'))
-    gate = json.load(open(os.path.join(HERE, 'gate.json')))['gate']
-    return nlp, clf, gate
+        download("en_core_web_sm")
+        nlp = spacy.load("en_core_web_sm")
+
+    with open(WEIGHTS_FILE, "r", encoding="utf-8") as f:
+        model = json.load(f)
+
+    # Validate the model artefact before using it.
+    required = {"mean", "std", "w", "b", "log_cols", "gate"}
+    if not required.issubset(model):
+        raise ValueError(
+            f"stage1_weights.json is missing keys: {required - set(model)}"
+        )
+
+    if not (
+        len(model["mean"]) == len(model["std"]) == len(model["w"]) == 9
+    ):
+        raise ValueError("Expected nine Stage 1 features in the JSON file.")
+
+    if any(float(s) == 0 for s in model["std"]):
+        raise ValueError("A feature standard deviation is zero.")
+
+    return nlp, model
+
 
 @st.cache_resource
 def load_detector():
+    """Load the more expensive LettuceDetect model."""
     from lettucedetect.models.inference import HallucinationDetector
-    return HallucinationDetector(method='transformer', model_path=MODEL_ID)
 
-NUM = re.compile(r'\d[\d,]*\.?\d*')
-def toks(t): return [w for w in re.findall(r'[a-z0-9]+', t.lower()) if w not in STOP_WORDS]
+    return HallucinationDetector(
+        method="transformer",
+        model_path=MODEL_ID,
+    )
 
-def stage1_prob(nlp, clf, answer, ctx):
+
+NUM = re.compile(r"\d[\d,]*\.?\d*")
+
+
+def toks(text):
+    """Lowercase and tokenise text, excluding English stopwords."""
+    return [
+        word
+        for word in re.findall(r"[a-z0-9]+", text.lower())
+        if word not in STOP_WORDS
+    ]
+
+
+def extract_features(nlp, answer, ctx):
+    """
+    Produce the nine features in the training order:
+    ov_min, ov_mean, bad_num, num_frac, bad_ent, ent_frac,
+    n_sent, n_tok, len_ratio.
+    """
     doc = nlp(answer)
-    ctx_l = ctx.lower(); ctx_tok = set(toks(ctx))
-    ctx_nums = {n.strip('.,') for n in NUM.findall(ctx)}
+    ctx_lower = ctx.lower()
+    ctx_tokens = set(toks(ctx))
+    ctx_numbers = {n.strip(".,") for n in NUM.findall(ctx)}
+
     rows = []
-    for s in doc.sents:
-        if not s.text.strip(): continue
-        st_ = toks(s.text)
-        ov = float(np.mean([w in ctx_tok for w in st_])) if st_ else 1.0
-        nums = [n.strip('.,') for n in NUM.findall(s.text)]
-        bad_n = sum(n not in ctx_nums for n in nums)
-        ents = [e.text.lower() for e in s.ents]
-        bad_e = sum(e not in ctx_l for e in ents)
-        rows.append((ov, bad_n, len(nums), bad_e, len(ents)))
-    if not rows: rows = [(1.0, 0, 0, 0, 0)]
-    a = np.array(rows, float)
-    feats = [a[:, 0].min(), a[:, 0].mean(), a[:, 1].sum(), a[:, 1].sum() / max(1, a[:, 2].sum()),
-             a[:, 3].sum(), a[:, 3].sum() / max(1, a[:, 4].sum()), len(rows), len(toks(answer)), len(answer) / max(1, len(ctx))]
-    return float(clf.predict_proba(np.array([feats]))[0, 1])
+
+    for sentence in doc.sents:
+        if not sentence.text.strip():
+            continue
+
+        sentence_tokens = toks(sentence.text)
+
+        overlap = (
+            float(np.mean([word in ctx_tokens for word in sentence_tokens]))
+            if sentence_tokens
+            else 1.0
+        )
+
+        numbers = [
+            number.strip(".,")
+            for number in NUM.findall(sentence.text)
+        ]
+        bad_numbers = sum(number not in ctx_numbers for number in numbers)
+
+        entities = [entity.text.lower() for entity in sentence.ents]
+        bad_entities = sum(entity not in ctx_lower for entity in entities)
+
+        rows.append(
+            (
+                overlap,
+                bad_numbers,
+                len(numbers),
+                bad_entities,
+                len(entities),
+            )
+        )
+
+    if not rows:
+        rows = [(1.0, 0, 0, 0, 0)]
+
+    a = np.asarray(rows, dtype=float)
+
+    features = np.array(
+        [
+            a[:, 0].min(),
+            a[:, 0].mean(),
+            a[:, 1].sum(),
+            a[:, 1].sum() / max(1, a[:, 2].sum()),
+            a[:, 3].sum(),
+            a[:, 3].sum() / max(1, a[:, 4].sum()),
+            len(rows),
+            len(toks(answer)),
+            len(answer) / max(1, len(ctx)),
+        ],
+        dtype=float,
+    )
+
+    return features
+
+
+def stage1_prob(nlp, model, answer, ctx):
+    """
+    Apply the same log transforms and standardisation used in training,
+    then calculate sigmoid(w dot z + b).
+    """
+    x = extract_features(nlp, answer, ctx)
+
+    # Apply log1p to the saved feature indices.
+    log_cols = np.asarray(model["log_cols"], dtype=int)
+    x[log_cols] = np.log1p(np.maximum(x[log_cols], 0.0))
+
+    mean = np.asarray(model["mean"], dtype=float)
+    std = np.asarray(model["std"], dtype=float)
+    weights = np.asarray(model["w"], dtype=float)
+    bias = float(model["b"])
+
+    # Standardise features using the training-set statistics.
+    z = (x - mean) / std
+
+    # Logistic Regression score and sigmoid probability.
+    score = float(np.dot(weights, z) + bias)
+    score = np.clip(score, -500.0, 500.0)
+    probability = 1.0 / (1.0 + np.exp(-score))
+
+    return float(probability)
+
 
 def highlight(answer, spans):
-    spans = sorted(spans, key=lambda s: int(s.get('start', 0)))
-    out, pos = [], 0
-    for s in spans:
-        a, b = int(s.get('start', 0)), int(s.get('end', 0))
-        if a < pos or b <= a: continue
-        out.append(html.escape(answer[pos:a]))
-        out.append('<mark style="background:#ffb3b3">' + html.escape(answer[a:b]) + '</mark>')
-        pos = b
-    out.append(html.escape(answer[pos:]))
-    return ''.join(out)
+    """Highlight text spans returned by LettuceDetect."""
+    spans = sorted(spans, key=lambda s: int(s.get("start", 0)))
+    output = []
+    position = 0
 
-EX_CTX = "Joe's Pizza is located at 12 Main Street. Hours: Monday to Sunday 11:00-22:00. It serves pizza, pasta and salads and has a 4.5 star rating."
-EX_ANS = "Joe's Pizza operates six days a week and is famous for its award-winning tiramisu."
+    for span in spans:
+        start = int(span.get("start", 0))
+        end = int(span.get("end", 0))
 
-st.title('RAG hallucination checker (CPU only)')
-st.write('Paste the **source text** a RAG system was given and the **answer** it wrote. A cheap first stage clears obviously clean answers; suspicious ones can be checked by LettuceDetect, which highlights unsupported parts. *Student research prototype; it can be wrong.*')
-if st.button('Load example'):
-    st.session_state['ctx'], st.session_state['ans'] = EX_CTX, EX_ANS
-ctx = st.text_area('Source text (context)', key='ctx', height=180)
-ans = st.text_area('Answer to check', key='ans', height=110)
-deep = st.toggle('Hybrid mode: also run the detailed LettuceDetect check on suspicious answers (slower, needs more memory)', value=DEEP_DEFAULT)
+        # Ignore invalid or overlapping spans.
+        if start < position or end <= start or end > len(answer):
+            continue
 
-if st.button('Check answer', type='primary'):
+        output.append(html.escape(answer[position:start]))
+        output.append(
+            '<mark style="background:#ffb3b3">'
+            + html.escape(answer[start:end])
+            + "</mark>"
+        )
+        position = end
+
+    output.append(html.escape(answer[position:]))
+    return "".join(output)
+
+
+EX_CTX = (
+    "Joe's Pizza is located at 12 Main Street. "
+    "Hours: Monday to Sunday 11:00-22:00. "
+    "It serves pizza, pasta and salads and has a 4.5 star rating."
+)
+EX_ANS = (
+    "Joe's Pizza operates six days a week and is famous "
+    "for its award-winning tiramisu."
+)
+
+
+st.title("RAG hallucination checker (CPU only)")
+st.write(
+    "Paste the **source text** a RAG system was given and the **answer** "
+    "it generated. A lightweight first-stage classifier estimates risk. "
+    "Suspicious answers can receive a detailed LettuceDetect check, "
+    "which may highlight unsupported spans. "
+    "*Student research prototype; results can be wrong.*"
+)
+
+if st.button("Load example"):
+    st.session_state["ctx"] = EX_CTX
+    st.session_state["ans"] = EX_ANS
+
+ctx = st.text_area("Source text (context)", key="ctx", height=180)
+ans = st.text_area("Answer to check", key="ans", height=110)
+
+deep = st.toggle(
+    "Hybrid mode: run LettuceDetect on suspicious answers "
+    "(slower and requires more memory)",
+    value=DEEP_DEFAULT,
+)
+
+if st.button("Check answer", type="primary"):
     if not ctx.strip() or not ans.strip():
-        st.warning('Please paste both a source text and an answer.')
+        st.warning("Please paste both a source text and an answer.")
     else:
-        nlp, clf, gate = load_stage1()
-        t0 = time.perf_counter()
-        p1 = stage1_prob(nlp, clf, ans, ctx)
-        t1 = time.perf_counter() - t0
-        if p1 < gate:
-            st.success(f'Not flagged: the cheap first stage found nothing suspicious (score {p1:.2f}, gate {gate:.2f}).')
-            st.caption(f'Time: {t1:.2f} s (Stage 1 only)')
-        elif not deep:
-            st.warning(f'Suspicious: the cheap first stage flagged this answer (score {p1:.2f}, gate {gate:.2f}). Turn on hybrid mode for the detailed check.')
-            st.caption(f'Time: {t1:.2f} s (Stage 1 only)')
-        else:
-            with st.spinner('Running the detailed check (the first run downloads the model and is slow)...'):
-                det = load_detector()
-                spans = det.predict(context=[ctx], question='', answer=ans, output_format='spans')
-            t2 = time.perf_counter() - t0
-            if spans:
-                st.error(f'Possible hallucination: {len(spans)} unsupported span(s) highlighted.')
-                st.markdown(highlight(ans, spans), unsafe_allow_html=True)
+        try:
+            nlp, model = load_stage1()
+            gate = float(model["gate"])
+
+            start_time = time.perf_counter()
+            p1 = stage1_prob(nlp, model, ans, ctx)
+            stage1_time = time.perf_counter() - start_time
+
+            st.write(f"**Stage 1 risk score:** {p1:.3f}")
+            st.write(f"**Gate threshold:** {gate:.2f}")
+
+            if p1 < gate:
+                st.info(
+                    "Stage 1 did not flag this answer, so LettuceDetect "
+                    "was skipped. This is not proof that the answer is correct."
+                )
+                st.caption(
+                    f"Time: {stage1_time:.2f} s (Stage 1 only)"
+                )
+
+            elif not deep:
+                st.warning(
+                    "Stage 1 flagged this answer as suspicious, but the "
+                    "detailed check has not run. Turn on hybrid mode to "
+                    "request the LettuceDetect check."
+                )
+                st.caption(
+                    f"Time: {stage1_time:.2f} s (Stage 1 only)"
+                )
+
             else:
-                st.success('No unsupported span found by the detailed check.')
-            st.caption(f'Time: {t2:.2f} s (Stage 1 + LettuceDetect)')
+                with st.spinner(
+                    "Running LettuceDetect. The first run may download "
+                    "the model and take longer."
+                ):
+                    detector = load_detector()
+                    spans = detector.predict(
+                        context=[ctx],
+                        question="",
+                        answer=ans,
+                        output_format="spans",
+                    )
+
+                total_time = time.perf_counter() - start_time
+
+                if spans:
+                    st.error(
+                        f"Possible hallucination: {len(spans)} "
+                        "unsupported span(s) returned by LettuceDetect."
+                    )
+                    st.markdown(
+                        highlight(ans, spans),
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.success(
+                        "LettuceDetect returned no unsupported spans. "
+                        "This does not guarantee that every claim is correct."
+                    )
+
+                st.caption(
+                    f"Time: {total_time:.2f} s "
+                    "(Stage 1 + LettuceDetect)"
+                )
+
+        except Exception as error:
+            st.error(
+                "The check failed. Review the Streamlit deployment logs "
+                "for details."
+            )
+            st.exception(error)
